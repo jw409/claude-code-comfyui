@@ -354,8 +354,12 @@ class ObservabilityHTTPHandler(BaseHTTPRequestHandler):
                 event['id'] = event_id
                 event['timestamp'] = datetime.now().isoformat()
                 
-                # Broadcast to WebSocket clients
-                asyncio.run(broadcast_event(event))
+                # Broadcast to WebSocket clients - format for Vue.js client
+                websocket_message = {
+                    'type': 'event',
+                    'data': event
+                }
+                asyncio.run(broadcast_websocket_message(websocket_message))
                 
                 # Send response
                 self.send_response(200)
@@ -441,6 +445,54 @@ class ObservabilityHTTPHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps(result).encode())
         
+        elif self.path == '/' or self.path == '/index.html':
+            """Serve the Vue.js frontend"""
+            try:
+                frontend_path = Path(__file__).parent.parent / "client" / "dist" / "index.html"
+                if frontend_path.exists():
+                    with open(frontend_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/html')
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.end_headers()
+                    self.wfile.write(content.encode('utf-8'))
+                else:
+                    self.send_error(404, 'Frontend not built. Run: npm run build in apps/client')
+            except Exception as e:
+                self.send_error(500, f'Error serving frontend: {str(e)}')
+        
+        elif self.path.startswith('/assets/'):
+            """Serve static assets"""
+            try:
+                asset_path = Path(__file__).parent.parent / "client" / "dist" / self.path.lstrip('/')
+                if asset_path.exists():
+                    # Determine content type
+                    if asset_path.suffix == '.js':
+                        content_type = 'application/javascript'
+                    elif asset_path.suffix == '.css':
+                        content_type = 'text/css'
+                    elif asset_path.suffix == '.png':
+                        content_type = 'image/png'
+                    elif asset_path.suffix == '.svg':
+                        content_type = 'image/svg+xml'
+                    else:
+                        content_type = 'application/octet-stream'
+                    
+                    with open(asset_path, 'rb') as f:
+                        content = f.read()
+                    
+                    self.send_response(200)
+                    self.send_header('Content-Type', content_type)
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.end_headers()
+                    self.wfile.write(content)
+                else:
+                    self.send_error(404, 'Asset not found')
+            except Exception as e:
+                self.send_error(500, f'Error serving asset: {str(e)}')
+        
         elif self.path == '/api/dashboard':
             """Unified dashboard endpoint - compete with TalentOS dashboard"""
             dashboard_data = {
@@ -471,31 +523,31 @@ class ObservabilityHTTPHandler(BaseHTTPRequestHandler):
         """Suppress default logging"""
         pass
 
-async def broadcast_event(event: Dict):
-    """Broadcast event to all connected WebSocket clients"""
+async def broadcast_websocket_message(message: Dict):
+    """Broadcast message to all connected WebSocket clients"""
     if ws_clients:
-        message = json.dumps(event)
+        json_message = json.dumps(message)
         disconnected = set()
         for client in ws_clients:
             try:
-                await client.send(message)
+                await client.send(json_message)
             except:
                 disconnected.add(client)
         # Remove disconnected clients
         for client in disconnected:
             ws_clients.discard(client)
 
-async def websocket_handler(websocket, path):
+async def websocket_handler(websocket):
     """Handle WebSocket connections"""
     ws_clients.add(websocket)
     logger.info(f"WebSocket client connected. Total clients: {len(ws_clients)}")
     
     try:
-        # Send initial data
+        # Send initial data in Vue.js client format
         events = db.get_recent_events(50)
         await websocket.send(json.dumps({
             'type': 'initial',
-            'events': events
+            'data': events
         }))
         
         # Keep connection alive
