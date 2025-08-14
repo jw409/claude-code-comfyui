@@ -21,7 +21,7 @@ import urllib.error
 from datetime import datetime
 from utils.summarizer import generate_event_summary
 
-def send_event_to_server(event_data, server_url='http://localhost:4000/events'):
+def send_event_to_server(event_data, server_url='http://localhost:8888/events'):
     """Send event data to the observability server."""
     try:
         # Prepare the request
@@ -54,7 +54,7 @@ def main():
     parser = argparse.ArgumentParser(description='Send Claude Code hook events to observability server')
     parser.add_argument('--source-app', required=True, help='Source application name')
     parser.add_argument('--event-type', required=True, help='Hook event type (PreToolUse, PostToolUse, etc.)')
-    parser.add_argument('--server-url', default='http://localhost:4000/events', help='Server URL')
+    parser.add_argument('--server-url', default='http://localhost:8888/events', help='Server URL')
     parser.add_argument('--add-chat', action='store_true', help='Include chat transcript if available')
     parser.add_argument('--summarize', action='store_true', help='Generate AI summary of the event')
     
