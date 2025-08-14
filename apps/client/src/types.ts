@@ -16,8 +16,9 @@ export interface FilterOptions {
 }
 
 export interface WebSocketMessage {
-  type: 'initial' | 'event';
-  data: HookEvent | HookEvent[];
+  type: 'initial' | 'event' | 'connection' | 'ping' | 'pong' | 'replay' | 'auth_success' | 'auth_error';
+  data: any;
+  timestamp?: string;
 }
 
 export type TimeRange = '1m' | '3m' | '5m';

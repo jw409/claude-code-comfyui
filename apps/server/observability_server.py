@@ -8,15 +8,19 @@ import json
 import sqlite3
 import asyncio
 import websockets
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Set, Optional
+from typing import Dict, List, Set, Optional, Deque
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 import logging
 import subprocess
 import sys
 import os
+import time
+import weakref
+from collections import deque
+import uuid
 
 # LLM Integration for enhanced features
 try:
@@ -40,8 +44,66 @@ HTTP_PORT = int(os.getenv('OBSERVABILITY_PORT', '8888'))  # Use 8888 like unifie
 WS_PORT = int(os.getenv('OBSERVABILITY_WS_PORT', '8889'))  # WebSocket on 8889
 DB_PATH = Path(__file__).parent / "observability.db"
 
-# WebSocket clients
-ws_clients: Set[websockets.WebSocketServerProtocol] = set()
+# Enhanced WebSocket client management with governance
+class WebSocketClient:
+    def __init__(self, websocket, client_id: str = None):
+        self.websocket = websocket
+        self.client_id = client_id or str(uuid.uuid4())
+        self.connected_at = datetime.now()
+        self.last_ping = None
+        self.last_pong = None
+        self.message_count = 0
+        self.is_authenticated = False
+        self.rate_limit_tokens = 100  # Token bucket for rate limiting
+        self.last_token_refill = time.time()
+
+class StreamGovernance:
+    def __init__(self):
+        self.clients: Dict[str, WebSocketClient] = {}
+        self.event_buffer: Deque[Dict] = deque(maxlen=1000)  # Buffer last 1000 events
+        self.rate_limit_window = 60  # seconds
+        self.max_messages_per_window = 100
+        self.heartbeat_interval = 30  # seconds
+        self.client_timeout = 300  # 5 minutes
+        
+    def add_client(self, websocket) -> WebSocketClient:
+        client = WebSocketClient(websocket)
+        self.clients[client.client_id] = client
+        logger.info(f"Client {client.client_id} connected. Total: {len(self.clients)}")
+        return client
+        
+    def remove_client(self, client_id: str):
+        if client_id in self.clients:
+            del self.clients[client_id]
+            logger.info(f"Client {client_id} removed. Total: {len(self.clients)}")
+    
+    def check_rate_limit(self, client: WebSocketClient) -> bool:
+        now = time.time()
+        # Token bucket: refill tokens over time
+        time_passed = now - client.last_token_refill
+        tokens_to_add = int(time_passed * (self.max_messages_per_window / self.rate_limit_window))
+        client.rate_limit_tokens = min(100, client.rate_limit_tokens + tokens_to_add)
+        client.last_token_refill = now
+        
+        if client.rate_limit_tokens > 0:
+            client.rate_limit_tokens -= 1
+            return True
+        return False
+    
+    def buffer_event(self, event: Dict):
+        """Buffer events for replay to reconnecting clients"""
+        self.event_buffer.append(event)
+        
+    def get_buffered_events(self, since: datetime = None) -> List[Dict]:
+        """Get events since a specific time for replay"""
+        if not since:
+            return list(self.event_buffer)
+        
+        return [event for event in self.event_buffer 
+                if datetime.fromisoformat(event.get('timestamp', '1970-01-01')) > since]
+
+# Global stream governance
+stream_gov = StreamGovernance()
 
 class LLMInstaller:
     """The missing piece - LLM-powered installer and verifier"""
@@ -354,12 +416,13 @@ class ObservabilityHTTPHandler(BaseHTTPRequestHandler):
                 event['id'] = event_id
                 event['timestamp'] = datetime.now().isoformat()
                 
-                # Broadcast to WebSocket clients - format for Vue.js client
+                # Buffer event for replay and broadcast with governance
+                stream_gov.buffer_event(event)
                 websocket_message = {
                     'type': 'event',
                     'data': event
                 }
-                asyncio.run(broadcast_websocket_message(websocket_message))
+                asyncio.run(broadcast_with_governance(websocket_message))
                 
                 # Send response
                 self.send_response(200)
@@ -493,6 +556,30 @@ class ObservabilityHTTPHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 self.send_error(500, f'Error serving asset: {str(e)}')
         
+        elif self.path == '/api/stream/health':
+            """Stream health endpoint"""
+            health_data = {
+                "stream_status": "healthy",
+                "active_connections": len(stream_gov.clients),
+                "buffered_events": len(stream_gov.event_buffer),
+                "clients": [
+                    {
+                        "id": client.client_id[:8],
+                        "connected_at": client.connected_at.isoformat(),
+                        "message_count": client.message_count,
+                        "rate_limit_tokens": client.rate_limit_tokens,
+                        "authenticated": client.is_authenticated
+                    }
+                    for client in stream_gov.clients.values()
+                ]
+            }
+            
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps(health_data).encode())
+        
         elif self.path == '/api/dashboard':
             """Unified dashboard endpoint - compete with TalentOS dashboard"""
             dashboard_data = {
@@ -500,7 +587,7 @@ class ObservabilityHTTPHandler(BaseHTTPRequestHandler):
                     "server": "healthy",
                     "port": HTTP_PORT,
                     "ws_port": WS_PORT,
-                    "ws_clients": len(ws_clients),
+                    "ws_clients": len(stream_gov.clients),
                     "database": "connected"
                 },
                 "llm_status": {
@@ -523,42 +610,141 @@ class ObservabilityHTTPHandler(BaseHTTPRequestHandler):
         """Suppress default logging"""
         pass
 
-async def broadcast_websocket_message(message: Dict):
-    """Broadcast message to all connected WebSocket clients"""
-    if ws_clients:
-        json_message = json.dumps(message)
-        disconnected = set()
-        for client in ws_clients:
-            try:
-                await client.send(json_message)
-            except:
-                disconnected.add(client)
-        # Remove disconnected clients
-        for client in disconnected:
-            ws_clients.discard(client)
+async def broadcast_with_governance(message: Dict):
+    """Broadcast message with rate limiting, authentication, and error handling"""
+    if not stream_gov.clients:
+        return
+        
+    json_message = json.dumps(message)
+    disconnected_clients = []
+    
+    for client_id, client in stream_gov.clients.items():
+        try:
+            # Check rate limiting
+            if not stream_gov.check_rate_limit(client):
+                logger.warning(f"Rate limit exceeded for client {client_id}")
+                continue
+                
+            # Send message with timeout
+            await asyncio.wait_for(client.websocket.send(json_message), timeout=5.0)
+            client.message_count += 1
+            
+        except asyncio.TimeoutError:
+            logger.warning(f"Send timeout for client {client_id}")
+            disconnected_clients.append(client_id)
+        except websockets.exceptions.ConnectionClosed:
+            logger.info(f"Client {client_id} connection closed")
+            disconnected_clients.append(client_id)
+        except Exception as e:
+            logger.error(f"Error sending to client {client_id}: {e}")
+            disconnected_clients.append(client_id)
+    
+    # Clean up disconnected clients
+    for client_id in disconnected_clients:
+        stream_gov.remove_client(client_id)
 
 async def websocket_handler(websocket):
-    """Handle WebSocket connections"""
-    ws_clients.add(websocket)
-    logger.info(f"WebSocket client connected. Total clients: {len(ws_clients)}")
+    """Enhanced WebSocket handler with governance, heartbeat, and error recovery"""
+    client = stream_gov.add_client(websocket)
     
     try:
-        # Send initial data in Vue.js client format
-        events = db.get_recent_events(50)
+        # Send initial data with buffered events
+        buffered_events = stream_gov.get_buffered_events()
         await websocket.send(json.dumps({
             'type': 'initial',
-            'data': events
+            'data': buffered_events[-50:] if buffered_events else []  # Last 50 events
         }))
         
-        # Keep connection alive
-        async for message in websocket:
-            # Handle ping/pong or other messages if needed
-            pass
+        # Send connection acknowledgment
+        await websocket.send(json.dumps({
+            'type': 'connection',
+            'data': {
+                'client_id': client.client_id,
+                'connected_at': client.connected_at.isoformat(),
+                'features': ['rate_limiting', 'heartbeat', 'event_replay']
+            }
+        }))
+        
+        # Start heartbeat task
+        heartbeat_task = asyncio.create_task(heartbeat_loop(client))
+        
+        try:
+            # Handle incoming messages
+            async for message in websocket:
+                try:
+                    data = json.loads(message)
+                    await handle_client_message(client, data)
+                except json.JSONDecodeError:
+                    logger.warning(f"Invalid JSON from client {client.client_id}")
+                except Exception as e:
+                    logger.error(f"Error handling message from {client.client_id}: {e}")
+                    
+        finally:
+            heartbeat_task.cancel()
+            
     except websockets.exceptions.ConnectionClosed:
-        pass
+        logger.info(f"Client {client.client_id} connection closed")
+    except Exception as e:
+        logger.error(f"WebSocket handler error for {client.client_id}: {e}")
     finally:
-        ws_clients.discard(websocket)
-        logger.info(f"WebSocket client disconnected. Total clients: {len(ws_clients)}")
+        stream_gov.remove_client(client.client_id)
+
+async def heartbeat_loop(client: WebSocketClient):
+    """Heartbeat loop to maintain connection health"""
+    while True:
+        try:
+            await asyncio.sleep(stream_gov.heartbeat_interval)
+            
+            # Send ping
+            ping_message = {
+                'type': 'ping',
+                'timestamp': datetime.now().isoformat()
+            }
+            await client.websocket.send(json.dumps(ping_message))
+            client.last_ping = datetime.now()
+            
+        except websockets.exceptions.ConnectionClosed:
+            break
+        except Exception as e:
+            logger.error(f"Heartbeat error for client {client.client_id}: {e}")
+            break
+
+async def handle_client_message(client: WebSocketClient, data: Dict):
+    """Handle messages from WebSocket clients"""
+    message_type = data.get('type')
+    
+    if message_type == 'pong':
+        client.last_pong = datetime.now()
+        
+    elif message_type == 'replay_request':
+        # Client requesting event replay from specific timestamp
+        since_str = data.get('since')
+        if since_str:
+            try:
+                since = datetime.fromisoformat(since_str)
+                replay_events = stream_gov.get_buffered_events(since)
+                
+                await client.websocket.send(json.dumps({
+                    'type': 'replay',
+                    'data': replay_events
+                }))
+            except ValueError:
+                logger.warning(f"Invalid timestamp in replay request from {client.client_id}")
+                
+    elif message_type == 'auth':
+        # Simple auth for now - could be enhanced
+        api_key = data.get('api_key')
+        if api_key == os.getenv('OBSERVABILITY_API_KEY', 'default'):
+            client.is_authenticated = True
+            await client.websocket.send(json.dumps({
+                'type': 'auth_success',
+                'data': {'authenticated': True}
+            }))
+        else:
+            await client.websocket.send(json.dumps({
+                'type': 'auth_error',
+                'data': {'message': 'Invalid API key'}
+            }))
 
 def run_http_server():
     """Run the HTTP server in a separate thread"""

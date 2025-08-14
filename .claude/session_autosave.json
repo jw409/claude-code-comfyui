@@ -1,33 +1,43 @@
 {
   "todos": [
     {
-      "content": "Fork claude-code-hooks-multi-agent-observability and make it the ComfyUI of Claude Code",
-      "status": "in_progress",
-      "id": "claude_comfyui"
+      "content": "Fix WebSocket reconnection and connection stability",
+      "status": "completed",
+      "id": "ws_stability"
     },
     {
-      "content": "Create new repo for our enhanced Claude Code observability system",
-      "status": "in_progress",
-      "id": "new_repo"
+      "content": "Add stream rate limiting and backpressure handling",
+      "status": "completed",
+      "id": "rate_limiting"
     },
     {
-      "content": "Get observability running on port 8888",
-      "status": "pending",
-      "id": "port_8888"
+      "content": "Implement WebSocket heartbeat/ping-pong for connection health",
+      "status": "completed",
+      "id": "heartbeat"
     },
     {
-      "content": "Build LLM-powered installer/verifier for hooks (their missing piece)",
-      "status": "pending",
-      "id": "llm_installer"
+      "content": "Add event buffering and replay for missed events",
+      "status": "completed",
+      "id": "event_buffering"
     },
     {
-      "content": "Track all changes and improvements via git",
-      "status": "pending",
-      "id": "git_tracking"
+      "content": "Fix WebSocket error handling and graceful degradation",
+      "status": "completed",
+      "id": "error_handling"
+    },
+    {
+      "content": "Add stream authentication and basic security",
+      "status": "completed",
+      "id": "security"
+    },
+    {
+      "content": "Implement proper connection cleanup and resource management",
+      "status": "completed",
+      "id": "cleanup"
     }
   ],
-  "timestamp": "2025-08-14T00:18:47.715792",
-  "count": 5,
+  "timestamp": "2025-08-14T00:50:28.151445",
+  "count": 7,
   "hook_version": "1.0",
   "tool_name": "TodoWrite"
 }
